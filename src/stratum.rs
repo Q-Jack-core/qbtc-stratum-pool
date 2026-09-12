@@ -1,0 +1,245 @@
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use tokio::net::{TcpListener, TcpStream};
+use tokio_util::codec::{Framed, LinesCodec};
+use futures::{StreamExt, SinkExt};
+use serde::{Deserialize, Serialize};
+use crate::state::PoolState;
+use redis::Client;
+
+#[derive(Deserialize, Debug)]
+pub struct StratumRequest {
+    pub id: Option<u64>,
+    pub method: String,
+    pub params: Vec<serde_json::Value>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct StratumResponse {
+    pub id: Option<u64>,
+    pub result: Option<serde_json::Value>,
+    pub error: Option<serde_json::Value>,
+}
+
+#[derive(Serialize, Debug)]
+pub struct StratumNotify {
+    pub id: Option<u64>,
+    pub method: String,
+    pub params: Vec<serde_json::Value>,
+}
+
+pub async fn start_stratum_server(state: Arc<PoolState>, port: u16, submit_url: String, redis_client: Client) {
+    let addr = format!("0.0.0.0:{}", port);
+    let listener = TcpListener::bind(&addr).await.unwrap();
+    tracing::info!("Stratum TCP Server active on {}", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((socket, peer_addr)) => {
+                let state_clone = Arc::clone(&state);
+                let submit_url_clone = submit_url.clone();
+                let redis_clone = redis_client.clone();
+                
+                tokio::spawn(async move {
+                    handle_miner_connection(socket, peer_addr, state_clone, submit_url_clone, redis_clone).await;
+                });
+            }
+            Err(e) => tracing::error!("TCP accept fault: {}", e),
+        }
+    }
+}
+
+fn hash_to_u64(hash: &[u8; 32]) -> u64 {
+    let mut bytes = [0u8; 8];
+    bytes.copy_from_slice(&hash[0..8]);
+    u64::from_be_bytes(bytes)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for &b in bytes {
+        s.push_str(&format!("{:02x}", b));
+    }
+    s
+}
+
+async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketAddr, state: Arc<PoolState>, submit_url: String, redis_client: Client) {
+    let mut framed = Framed::new(socket, LinesCodec::new());
+    let mut authorized_miner: Option<String> = None;
+    
+    let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
+        Ok(conn) => conn,
+        Err(e) => {
+            tracing::error!("Redis connection failed: {}", e);
+            return;
+        }
+    };
+    
+    let mut pool_target_multiplier: u64 = 1000;
+    let mut share_count = 0;
+    let mut window_start = Instant::now();
+    let session_id = format!("{:x}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos());
+
+    let mut last_notified_height = 0u64;
+    let mut ticker = tokio::time::interval(Duration::from_millis(500));
+
+    loop {
+        tokio::select! {
+            _ = ticker.tick() => {
+                if authorized_miner.is_some() {
+                    let current_h = *state.current_height.read().await;
+                    if current_h > last_notified_height {
+                        last_notified_height = current_h;
+                        let mainnet_t = *state.current_target.read().await;
+                        
+                        let (prev_hex, merkle_hex, commit_hex, ts) = {
+                            let block_lock = state.current_block.read().await;
+                            if let Some(ref block) = *block_lock {
+                                (
+                                    encode_hex(&block.header.previous_hash),
+                                    encode_hex(&block.header.merkle_root),
+                                    encode_hex(&block.header.commit_merkle_root),
+                                    block.header.timestamp
+                                )
+                            } else {
+                                (String::new(), String::new(), String::new(), 0u64)
+                            }
+                        };
+                        
+                        if !prev_hex.is_empty() {
+                            let pool_target = mainnet_t.saturating_mul(pool_target_multiplier);
+                            let notify = StratumNotify {
+                                id: None,
+                                method: "mining.notify".to_string(),
+                                params: vec![
+                                    serde_json::json!(current_h),
+                                    serde_json::json!(prev_hex),
+                                    serde_json::json!(merkle_hex),
+                                    serde_json::json!(commit_hex),
+                                    serde_json::json!(ts),
+                                    serde_json::json!(mainnet_t),
+                                    serde_json::json!(pool_target),
+                                ],
+                            };
+                            if framed.send(serde_json::to_string(&notify).unwrap()).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+            
+            result = framed.next() => {
+                let line = match result {
+                    Some(Ok(line)) => line,
+                    _ => break,
+                };
+                
+                if let Ok(req) = serde_json::from_str::<StratumRequest>(&line) {
+                    if req.method == "mining.subscribe" {
+                        let res = StratumResponse { id: req.id, result: Some(serde_json::json!(["qbtc-stratum-v1", session_id])), error: None };
+                        let _ = framed.send(serde_json::to_string(&res).unwrap()).await;
+                        
+                    } else if req.method == "mining.authorize" {
+                        if !req.params.is_empty() {
+                            if let Some(miner_addr) = req.params[0].as_str() {
+                                authorized_miner = Some(miner_addr.to_string());
+                                tracing::info!("Miner active: {} (IP: {})", miner_addr, peer_addr);
+                            }
+                        }
+                        let res = StratumResponse { id: req.id, result: Some(serde_json::json!(true)), error: None };
+                        let _ = framed.send(serde_json::to_string(&res).unwrap()).await;
+                        
+                        last_notified_height = 0;
+                        
+                    } else if req.method == "mining.submit" {
+                        let current_miner = match &authorized_miner {
+                            Some(addr) => addr.clone(),
+                            None => continue,
+                        };
+
+                        if req.params.len() < 3 { continue; }
+
+                        let submitted_job_id = req.params[1].as_u64().unwrap_or(0);
+                        let submitted_nonce = req.params[2].as_u64().unwrap_or(0);
+
+                        let mut candidate_block = {
+                            let block_lock = state.current_block.read().await;
+                            if let Some(ref block) = *block_lock {
+                                let current_h = *state.current_height.read().await;
+                                if submitted_job_id != current_h {
+                                    continue;
+                                }
+                                block.clone()
+                            } else {
+                                continue;
+                            }
+                        };
+
+                        candidate_block.header.nonce = submitted_nonce;
+                        
+                        let hash_result = tokio::task::spawn_blocking(move || {
+                            candidate_block.calculate_hash()
+                        }).await.unwrap();
+
+                        let hash_num = hash_to_u64(&hash_result);
+                        let mainnet_target = *state.current_target.read().await;
+                        let current_pool_target = mainnet_target.saturating_mul(pool_target_multiplier);
+
+                        share_count += 1;
+                        if window_start.elapsed() >= Duration::from_secs(10) {
+                            let mut diff_changed = false;
+                            if share_count > 3 { 
+                                pool_target_multiplier = pool_target_multiplier.saturating_div(2).max(1); 
+                                diff_changed = true;
+                            } 
+                            else if share_count == 0 { 
+                                pool_target_multiplier = pool_target_multiplier.saturating_mul(2); 
+                                diff_changed = true;
+                            }
+                            share_count = 0;
+                            window_start = Instant::now();
+                            if diff_changed {
+                                last_notified_height = 0;
+                            }
+                        }
+
+                        if hash_num <= mainnet_target {
+                            tracing::warn!("L1 BLOCK FOUND! Broadcasting to mainnet...");
+                            let res = StratumResponse { id: req.id, result: Some(serde_json::json!(true)), error: None };
+                            let _ = framed.send(serde_json::to_string(&res).unwrap()).await;
+
+                            let url = submit_url.clone();
+                            let mut submit_block = {
+                                let block_lock = state.current_block.read().await;
+                                block_lock.as_ref().unwrap().clone()
+                            };
+                            submit_block.header.nonce = submitted_nonce;
+                            let current_job_id = submitted_job_id;
+
+                            tokio::spawn(async move {
+                                let client = reqwest::Client::new();
+                                let payload = serde_json::json!({ "block": submit_block });
+                                let _ = client.post(&url).json(&payload).send().await;
+                            });
+
+                            let block_key = format!("pool:blocks:{}", current_job_id);
+                            let _: redis::RedisResult<()> = redis::cmd("SET").arg(&block_key).arg(&current_miner).query_async(&mut redis_conn).await;
+
+                        } else if hash_num <= current_pool_target {
+                            tracing::debug!("Valid Pool Share recorded for: {}", current_miner);
+                            let redis_key = format!("pool:shares:{}", submitted_job_id);
+                            let _: redis::RedisResult<()> = redis::cmd("ZINCRBY").arg(&redis_key).arg(1).arg(&current_miner).query_async(&mut redis_conn).await;
+
+                            let res = StratumResponse { id: req.id, result: Some(serde_json::json!(true)), error: None };
+                            let _ = framed.send(serde_json::to_string(&res).unwrap()).await;
+                        } else {
+                            let res = StratumResponse { id: req.id, result: None, error: Some(serde_json::json!("Low difficulty share")) };
+                            let _ = framed.send(serde_json::to_string(&res).unwrap()).await;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

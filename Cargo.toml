@@ -1,0 +1,32 @@
+[package]
+name = "qbtc-stratum-pool"
+version = "0.1.0"
+edition = "2021"
+authors = ["Yong Cui <Q-Jack-core>"]
+description = "Official Stratum Pool Gateway for Quantum Bitcoin (Q-BTC)"
+
+[dependencies]
+# Async runtime for handling massive concurrent TCP miner connections
+tokio = { version = "1.36", features = ["full"] }
+
+# Serialization framework for Stratum JSON-RPC protocol
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Async HTTP client to poll Layer 1 node for block templates
+reqwest = { version = "0.12", features = ["json"] }
+
+# Cryptographic hashing for PoW Share validation
+sha2 = "0.10"
+hex = "0.4"
+
+# Safe async concurrency primitives and I/O utilities
+tokio-util = { version = "0.7", features = ["codec"] }
+bytes = "1.5"
+
+# Asynchronous telemetry and logging framework
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures = "0.3.34"
+redis = { version = "1.6.0", features = ["tokio-comp"] }
+quantum-btc = { path = "../quantum-btc" }
