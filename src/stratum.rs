@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::{Framed, LinesCodec};
@@ -143,6 +144,9 @@ async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketA
                     } else if req.method == "mining.authorize" {
                         if !req.params.is_empty() {
                             if let Some(miner_addr) = req.params[0].as_str() {
+                                if authorized_miner.is_none() {
+                                    state.active_miners.fetch_add(1, Ordering::SeqCst);
+                                }
                                 authorized_miner = Some(miner_addr.to_string());
                                 tracing::info!("Miner active: {} (IP: {})", miner_addr, peer_addr);
                             }
@@ -227,6 +231,7 @@ async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketA
                             let _: redis::RedisResult<()> = redis::cmd("SET").arg(&block_key).arg(&current_miner).query_async(&mut redis_conn).await;
 
                         } else if hash_num <= current_pool_target {
+                            state.pool_shares_count.fetch_add(1, Ordering::Relaxed);
                             tracing::debug!("Valid Pool Share recorded for: {}", current_miner);
                             let redis_key = format!("pool:shares:{}", submitted_job_id);
                             let _: redis::RedisResult<()> = redis::cmd("ZINCRBY").arg(&redis_key).arg(1).arg(&current_miner).query_async(&mut redis_conn).await;
@@ -241,5 +246,10 @@ async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketA
                 }
             }
         }
+    }
+
+    if let Some(miner_addr) = authorized_miner {
+        state.active_miners.fetch_sub(1, Ordering::SeqCst);
+        tracing::info!("Miner disconnected: {}", miner_addr);
     }
 }
