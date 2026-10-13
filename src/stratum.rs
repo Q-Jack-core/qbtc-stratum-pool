@@ -329,6 +329,7 @@ async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketA
                         } else if hash_num <= current_pool_target {
                             share_count += 1;
                             state.pool_shares_count.fetch_add(1, Ordering::Relaxed);
+                            state.record_share_work(current_pool_target).await;
                             tracing::debug!("Valid Pool Share recorded for: {}", current_miner);
                             let redis_key = format!("pool:shares:{}", submitted_job_id);
                             let _: redis::RedisResult<()> = redis::cmd("ZINCRBY").arg(&redis_key).arg(1).arg(&current_miner).query_async(&mut redis_conn).await;
