@@ -1,12 +1,18 @@
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::net::{TcpListener, TcpStream};
 use tokio_util::codec::{Framed, LinesCodec};
 use futures::{StreamExt, SinkExt};
 use serde::{Deserialize, Serialize};
 use crate::state::PoolState;
+use quantum_btc::wallet::QuantumWallet;
 use redis::Client;
+
+/// A Stratum line is a short JSON object. LinesCodec::new() applies no limit,
+/// so a client that sends bytes without a newline would make the codec buffer
+/// until the process runs out of memory.
+const MAX_LINE_BYTES: usize = 8 * 1024;
 
 /// Vardiff retarget window, and the accepted-share count band that is left
 /// alone. Outside the band the per-session target multiplier halves or
@@ -39,6 +45,24 @@ pub struct StratumNotify {
     pub params: Vec<serde_json::Value>,
 }
 
+/// Holds the active-miner gauge down for the life of the connection task.
+/// The count is published at /api/stats, so a task that unwinds past a bare
+/// fetch_sub would inflate it for as long as the process runs.
+struct ActiveMinerGuard(Arc<AtomicUsize>);
+
+impl ActiveMinerGuard {
+    fn new(counter: Arc<AtomicUsize>) -> Self {
+        counter.fetch_add(1, Ordering::SeqCst);
+        Self(counter)
+    }
+}
+
+impl Drop for ActiveMinerGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 pub async fn start_stratum_server(state: Arc<PoolState>, port: u16, submit_url: String, redis_client: Client) {
     let addr = format!("0.0.0.0:{}", port);
     let listener = TcpListener::bind(&addr).await.unwrap();
@@ -60,14 +84,6 @@ pub async fn start_stratum_server(state: Arc<PoolState>, port: u16, submit_url: 
     }
 }
 
-fn encode_hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push_str(&format!("{:02x}", b));
-    }
-    s
-}
-
 fn hash_to_u64(hash: &[u8; 32]) -> u64 {
     let mut bytes = [0u8; 8];
     bytes.copy_from_slice(&hash[0..8]);
@@ -75,8 +91,9 @@ fn hash_to_u64(hash: &[u8; 32]) -> u64 {
 }
 
 async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketAddr, state: Arc<PoolState>, submit_url: String, redis_client: Client) {
-    let mut framed = Framed::new(socket, LinesCodec::new());
+    let mut framed = Framed::new(socket, LinesCodec::new_with_max_length(MAX_LINE_BYTES));
     let mut authorized_miner: Option<String> = None;
+    let mut active_guard: Option<ActiveMinerGuard> = None;
     
     let mut redis_conn = match redis_client.get_multiplexed_async_connection().await {
         Ok(conn) => conn,
@@ -135,9 +152,9 @@ async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketA
                             let block_lock = state.current_block.read().await;
                             if let Some(ref block) = *block_lock {
                                 (
-                                    encode_hex(&block.header.previous_hash),
-                                    encode_hex(&block.header.merkle_root),
-                                    encode_hex(&block.header.commit_merkle_root),
+                                    hex::encode(block.header.previous_hash),
+                                    hex::encode(block.header.merkle_root),
+                                    hex::encode(block.header.commit_merkle_root),
                                     block.header.timestamp
                                 )
                             } else {
@@ -174,7 +191,11 @@ async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketA
             result = framed.next() => {
                 let line = match result {
                     Some(Ok(line)) => line,
-                    _ => break,
+                    Some(Err(e)) => {
+                        tracing::warn!("Protocol fault from {}: {}", peer_addr, e);
+                        break;
+                    }
+                    None => break,
                 };
                 
                 if let Ok(req) = serde_json::from_str::<StratumRequest>(&line) {
@@ -183,15 +204,29 @@ async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketA
                         let _ = framed.send(serde_json::to_string(&res).unwrap()).await;
                         
                     } else if req.method == "mining.authorize" {
-                        if !req.params.is_empty() {
-                            if let Some(miner_addr) = req.params[0].as_str() {
-                                if authorized_miner.is_none() {
-                                    state.active_miners.fetch_add(1, Ordering::SeqCst);
-                                }
-                                authorized_miner = Some(miner_addr.to_string());
-                                tracing::info!("Miner active: {} (IP: {})", miner_addr, peer_addr);
-                            }
+                        let miner_addr = req.params.first().and_then(|v| v.as_str()).unwrap_or("");
+
+                        // An address that does not decode can never be paid, and
+                        // it still lands in Redis as a sorted-set member of
+                        // whatever length the client chose. Reject it here rather
+                        // than storing it.
+                        if QuantumWallet::decode_qbtc_address(miner_addr).is_none() {
+                            tracing::warn!("Rejected mining.authorize from {}: payout address does not decode", peer_addr);
+                            let res = StratumResponse {
+                                id: req.id,
+                                result: Some(serde_json::json!(false)),
+                                error: Some(serde_json::json!("Invalid Q-BTC payout address")),
+                            };
+                            let _ = framed.send(serde_json::to_string(&res).unwrap()).await;
+                            continue;
                         }
+
+                        if active_guard.is_none() {
+                            active_guard = Some(ActiveMinerGuard::new(Arc::clone(&state.active_miners)));
+                        }
+                        authorized_miner = Some(miner_addr.to_string());
+                        tracing::info!("Miner active: {} (IP: {})", miner_addr, peer_addr);
+
                         let res = StratumResponse { id: req.id, result: Some(serde_json::json!(true)), error: None };
                         let _ = framed.send(serde_json::to_string(&res).unwrap()).await;
                         
@@ -310,8 +345,8 @@ async fn handle_miner_connection(socket: TcpStream, peer_addr: std::net::SocketA
         }
     }
 
+    // active_guard drops here, and on an unwind, so the gauge stays balanced.
     if let Some(miner_addr) = authorized_miner {
-        state.active_miners.fetch_sub(1, Ordering::SeqCst);
         tracing::info!("Miner disconnected: {}", miner_addr);
     }
 }
