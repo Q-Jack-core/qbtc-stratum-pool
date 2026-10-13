@@ -4,7 +4,7 @@ mod stratum;
 
 use axum::{routing::get, Json, Router};
 use serde::Serialize;
-use state::PoolState;
+use state::{PoolState, HASHRATE_WINDOW};
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -14,6 +14,8 @@ pub struct PoolStatsResponse {
     pub fee_percent: f64,
     pub active_miners: usize,
     pub pool_hashrate_est: u64,
+    pub hashrate_window_secs: u64,
+    pub accepted_shares: u64,
     pub current_height: u64,
     pub current_target: u64,
 }
@@ -24,14 +26,15 @@ async fn get_pool_stats(
     let miners = state.active_miners.load(Ordering::Relaxed);
     let height = *state.current_height.read().await;
     let target = *state.current_target.read().await;
-    
-    let estimated_hashrate = (miners as u64) * 50_000; 
 
     Json(PoolStatsResponse {
         pool_name: "Q-BTC Core Official Pool".to_string(),
         fee_percent: 0.0,
         active_miners: miners,
-        pool_hashrate_est: estimated_hashrate,
+        // Measured from accepted share work, not inferred from the miner count.
+        pool_hashrate_est: state.measured_hashrate().await,
+        hashrate_window_secs: HASHRATE_WINDOW.as_secs(),
+        accepted_shares: state.pool_shares_count.load(Ordering::Relaxed),
         current_height: height,
         current_target: target,
     })
